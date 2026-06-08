@@ -75,8 +75,7 @@ Copy `.env.example` to `.env` and fill in your values first. Never commit `.env`
 ## Security
 
 See [`SECURITY.md`](SECURITY.md). Report vulnerabilities privately to
-`security@berryfi.org`. A bug bounty runs alongside the independent audit prior
-to mainnet.
+`security@berryfi.org'.
 
 ## License
 

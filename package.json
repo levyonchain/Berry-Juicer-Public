@@ -1,0 +1,19 @@
+{
+  "name": "berry-juicer",
+  "version": "0.1.0",
+  "description": "Berry Juicer: single-sided yield on idle token supply, built for AI agents. Public contracts, periphery, and SDK.",
+  "license": "BUSL-1.1",
+  "scripts": {
+    "build": "hardhat compile",
+    "test:hardhat": "hardhat test",
+    "test:forge": "forge test -vvv",
+    "test": "forge test -vvv",
+    "fmt": "forge fmt",
+    "fmt:check": "forge fmt --check"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-foundry": "^1.1.2",
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.22.0"
+  }
+}

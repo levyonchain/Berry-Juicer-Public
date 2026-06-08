@@ -4,57 +4,64 @@ pragma solidity ^0.8.24;
 import {IBerryJuicer} from "../interfaces/IBerryJuicer.sol";
 import {YieldSplit} from "../libraries/YieldSplit.sol";
 
+interface IJuicerFactoryView {
+    function vaultsOf(address creator) external view returns (address[] memory);
+}
+
 /// @title JuicerLens
-/// @notice Read-only convenience layer over {IBerryJuicer}. Bundles the calls an agent or
-///         frontend usually wants into a single round trip. Holds no funds and no permissions.
-/// @dev Periphery, fully open. Nothing here touches the proprietary strategy; it only composes
-///      public view functions and the open {YieldSplit} math.
+/// @notice Read-only convenience layer over Berry Juicer position vaults. Bundles the calls an
+///         agent or frontend usually wants into a single round trip. Holds no funds, no permissions.
+/// @dev Periphery, fully open. Composes public view functions and the open {YieldSplit} math; never
+///      touches the proprietary strategy.
 contract JuicerLens {
-    IBerryJuicer public immutable juicer;
-
-    constructor(address juicer_) {
-        juicer = IBerryJuicer(juicer_);
-    }
-
-    /// @notice A flattened snapshot of a position, suitable for direct rendering.
     struct PositionView {
+        address vault;
         address creator;
         address token;
         uint256 amount;
-        IBerryJuicer.YieldMode mode;
-        uint256 pendingTotal; // total accrued yield (quote terms)
-        uint256 pendingCreator; // creator's share after the protocol fee
-        uint256 pendingProtocol; // protocol's share
+        bool open;
+        uint256 pendingFees;
+        uint256 creatorValue; // to be credited as inference for the creator
+        uint256 protocolMargin; // retained by the protocol
     }
 
-    /// @notice Read a full position snapshot in one call, including the projected yield split.
-    function getPosition(uint256 positionId) external view returns (PositionView memory view_) {
-        (address creator, address token, uint256 amount, IBerryJuicer.YieldMode mode) =
-            juicer.positionInfo(positionId);
-
-        uint256 pending = juicer.pendingYield(positionId);
-        (uint256 protocolShare, uint256 creatorShare) = YieldSplit.split(pending, juicer.protocolFeeBps());
+    /// @notice Snapshot a single position vault, including the projected fee split.
+    function getPosition(address vault) public view returns (PositionView memory view_) {
+        IBerryJuicer j = IBerryJuicer(vault);
+        (address token, uint256 amount, bool open) = j.position();
+        uint256 fees = j.pendingFees();
+        (uint256 creatorValue, uint256 protocolMargin) = YieldSplit.split(fees, j.creatorShareBps());
 
         view_ = PositionView({
-            creator: creator,
+            vault: vault,
+            creator: j.creator(),
             token: token,
             amount: amount,
-            mode: mode,
-            pendingTotal: pending,
-            pendingCreator: creatorShare,
-            pendingProtocol: protocolShare
+            open: open,
+            pendingFees: fees,
+            creatorValue: creatorValue,
+            protocolMargin: protocolMargin
         });
     }
 
-    /// @notice Batch-read several positions at once. Convenient for agents polling many vaults.
-    function getPositions(uint256[] calldata positionIds)
+    /// @notice Snapshot several vaults at once. Convenient for agents polling many positions.
+    function getPositions(address[] calldata vaults) external view returns (PositionView[] memory views) {
+        views = new PositionView[](vaults.length);
+        for (uint256 i = 0; i < vaults.length; i++) {
+            views[i] = getPosition(vaults[i]);
+        }
+    }
+
+    /// @notice Snapshot every vault a creator owns, via the factory's index.
+    function getCreatorPositions(address factory, address creator)
         external
         view
         returns (PositionView[] memory views)
     {
-        views = new PositionView[](positionIds.length);
-        for (uint256 i = 0; i < positionIds.length; i++) {
-            views[i] = this.getPosition(positionIds[i]);
+        address[] memory vaults = IJuicerFactoryView(factory).vaultsOf(creator);
+        views = new PositionView[](vaults.length);
+        for (uint256 i = 0; i < vaults.length; i++) {
+            views[i] = getPosition(vaults[i]);
         }
     }
 }

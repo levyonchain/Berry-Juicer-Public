@@ -1,196 +1,186 @@
 /**
  * @berry/juicer-sdk
  *
- * A small, dependency-light client for Berry Juicer. It wraps the public vault
- * surface so wallets and agents can read positions and build transactions
- * without hand-assembling ABI calls. It speaks only to the open contracts; it
- * has no knowledge of the proprietary position strategy.
+ * A small, dependency-light client for Berry Juicer. Berry Juicer deploys one
+ * isolated vault per position (via a factory); this SDK wraps both the factory
+ * (to create positions and enumerate them) and individual position vaults (to
+ * read state and exit). It speaks only to the open contracts; it has no
+ * knowledge of the proprietary position strategy.
+ *
+ * Payout model: a position's deposited supply is the creator's principal and is
+ * returned on withdraw. The fees it earns are split; the creator's share is
+ * credited as AI inference (fulfilled off-chain via partner programs) and the
+ * protocol keeps the remainder as margin. The creator does not receive the quote
+ * asset for their fee share.
  */
-import {
-  type Address,
-  type PublicClient,
-  type WalletClient,
-} from "viem";
+import { type Address, type PublicClient, type WalletClient } from "viem";
 
-/** How a creator elects to receive yield. Mirrors the on-chain enum. */
-export enum YieldMode {
-  Quote = 0,
-  Inference = 1,
-}
-
-/** Minimal ABI for the public vault surface the SDK needs. */
-export const berryJuicerAbi = [
+/** ABI for the factory that deploys per-position vaults. */
+export const factoryAbi = [
   {
     type: "function",
-    name: "deposit",
+    name: "createVault",
     stateMutability: "nonpayable",
     inputs: [
       { name: "token", type: "address" },
       { name: "amount", type: "uint256" },
-      { name: "mode", type: "uint8" },
     ],
-    outputs: [{ name: "positionId", type: "uint256" }],
+    outputs: [{ name: "vault", type: "address" }],
   },
   {
     type: "function",
-    name: "withdraw",
-    stateMutability: "nonpayable",
-    inputs: [{ name: "positionId", type: "uint256" }],
-    outputs: [],
+    name: "vaultsOf",
+    stateMutability: "view",
+    inputs: [{ name: "creator", type: "address" }],
+    outputs: [{ name: "", type: "address[]" }],
   },
   {
     type: "function",
-    name: "setYieldMode",
-    stateMutability: "nonpayable",
-    inputs: [
-      { name: "positionId", type: "uint256" },
-      { name: "mode", type: "uint8" },
-    ],
-    outputs: [],
+    name: "creatorShareBps",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "uint256" }],
   },
+] as const;
+
+/** ABI for an individual position vault. */
+export const vaultAbi = [
+  { type: "function", name: "harvest", stateMutability: "nonpayable", inputs: [], outputs: [] },
+  { type: "function", name: "withdraw", stateMutability: "nonpayable", inputs: [], outputs: [] },
+  { type: "function", name: "creator", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "address" }] },
   {
     type: "function",
-    name: "protocolFeeBps",
+    name: "creatorShareBps",
     stateMutability: "view",
     inputs: [],
     outputs: [{ name: "", type: "uint256" }],
   },
   {
     type: "function",
-    name: "pendingYield",
+    name: "pendingFees",
     stateMutability: "view",
-    inputs: [{ name: "positionId", type: "uint256" }],
+    inputs: [],
     outputs: [{ name: "", type: "uint256" }],
   },
   {
     type: "function",
-    name: "positionInfo",
+    name: "position",
     stateMutability: "view",
-    inputs: [{ name: "positionId", type: "uint256" }],
+    inputs: [],
     outputs: [
-      { name: "creator", type: "address" },
       { name: "token", type: "address" },
       { name: "amount", type: "uint256" },
-      { name: "mode", type: "uint8" },
+      { name: "open", type: "bool" },
     ],
   },
 ] as const;
 
 export interface PositionInfo {
-  creator: Address;
   token: Address;
   amount: bigint;
-  mode: YieldMode;
+  open: boolean;
 }
 
-export interface JuicerClientConfig {
-  vault: Address;
+interface ClientCtx {
   publicClient: PublicClient;
-  /** Optional. Required only for write calls (deposit, withdraw, setYieldMode). */
   walletClient?: WalletClient;
 }
 
-/**
- * Typed client for a single Berry Juicer vault deployment.
- *
- * Reads work with just a public client. Writes require a wallet client; the
- * SDK never holds or sees a private key, it only asks the provided wallet to
- * sign.
- */
-export class JuicerClient {
-  private readonly vault: Address;
-  private readonly publicClient: PublicClient;
-  private readonly walletClient?: WalletClient;
+function requireWallet(ctx: ClientCtx): WalletClient {
+  if (!ctx.walletClient) throw new Error("A walletClient is required for write operations.");
+  return ctx.walletClient;
+}
 
-  constructor(config: JuicerClientConfig) {
-    this.vault = config.vault;
-    this.publicClient = config.publicClient;
-    this.walletClient = config.walletClient;
-  }
+/** Client for the Berry Juicer factory: create positions and enumerate them. */
+export class JuicerFactoryClient {
+  constructor(
+    private readonly factory: Address,
+    private readonly ctx: ClientCtx,
+  ) {}
 
-  /** The protocol fee, in basis points. */
-  async protocolFeeBps(): Promise<bigint> {
-    return this.publicClient.readContract({
-      address: this.vault,
-      abi: berryJuicerAbi,
-      functionName: "protocolFeeBps",
-    });
-  }
-
-  /** Static parameters of a position. */
-  async positionInfo(positionId: bigint): Promise<PositionInfo> {
-    const [creator, token, amount, mode] = await this.publicClient.readContract({
-      address: this.vault,
-      abi: berryJuicerAbi,
-      functionName: "positionInfo",
-      args: [positionId],
-    });
-    return { creator, token, amount, mode: mode as YieldMode };
-  }
-
-  /** Accrued, undistributed yield for a position, in quote-asset terms. */
-  async pendingYield(positionId: bigint): Promise<bigint> {
-    return this.publicClient.readContract({
-      address: this.vault,
-      abi: berryJuicerAbi,
-      functionName: "pendingYield",
-      args: [positionId],
-    });
-  }
-
-  /** Split pending yield into creator and protocol shares, off-chain. */
-  async pendingSplit(positionId: bigint): Promise<{ creator: bigint; protocol: bigint }> {
-    const [pending, feeBps] = await Promise.all([
-      this.pendingYield(positionId),
-      this.protocolFeeBps(),
-    ]);
-    const protocol = (pending * feeBps) / 10_000n;
-    return { creator: pending - protocol, protocol };
-  }
-
-  /** Open a position. Requires a wallet client and a prior token approval. */
-  async deposit(token: Address, amount: bigint, mode: YieldMode): Promise<`0x${string}`> {
-    const wallet = this.requireWallet();
+  /** Create an isolated position vault, depositing `amount` of `token`. Requires approval to the factory. */
+  async createVault(token: Address, amount: bigint): Promise<`0x${string}`> {
+    const wallet = requireWallet(this.ctx);
     return wallet.writeContract({
-      address: this.vault,
-      abi: berryJuicerAbi,
-      functionName: "deposit",
-      args: [token, amount, mode],
+      address: this.factory,
+      abi: factoryAbi,
+      functionName: "createVault",
+      args: [token, amount],
       account: wallet.account ?? null,
       chain: wallet.chain,
     });
   }
 
-  /** Change how a position's yield is paid out. */
-  async setYieldMode(positionId: bigint, mode: YieldMode): Promise<`0x${string}`> {
-    const wallet = this.requireWallet();
+  /** All vault addresses a creator owns. */
+  async vaultsOf(creator: Address): Promise<readonly Address[]> {
+    return this.ctx.publicClient.readContract({
+      address: this.factory,
+      abi: factoryAbi,
+      functionName: "vaultsOf",
+      args: [creator],
+    });
+  }
+}
+
+/** Client for a single Berry Juicer position vault. */
+export class JuicerVaultClient {
+  constructor(
+    private readonly vault: Address,
+    private readonly ctx: ClientCtx,
+  ) {}
+
+  async creator(): Promise<Address> {
+    return this.ctx.publicClient.readContract({ address: this.vault, abi: vaultAbi, functionName: "creator" });
+  }
+
+  async creatorShareBps(): Promise<bigint> {
+    return this.ctx.publicClient.readContract({ address: this.vault, abi: vaultAbi, functionName: "creatorShareBps" });
+  }
+
+  async position(): Promise<PositionInfo> {
+    const [token, amount, open] = await this.ctx.publicClient.readContract({
+      address: this.vault,
+      abi: vaultAbi,
+      functionName: "position",
+    });
+    return { token, amount, open };
+  }
+
+  async pendingFees(): Promise<bigint> {
+    return this.ctx.publicClient.readContract({ address: this.vault, abi: vaultAbi, functionName: "pendingFees" });
+  }
+
+  /** Project how pending fees split: creator value (credited as inference) and protocol margin. */
+  async pendingSplit(): Promise<{ creatorValue: bigint; protocolMargin: bigint }> {
+    const [fees, shareBps] = await Promise.all([this.pendingFees(), this.creatorShareBps()]);
+    const marginBps = 10_000n - shareBps;
+    const protocolMargin = (fees * marginBps) / 10_000n;
+    return { creatorValue: fees - protocolMargin, protocolMargin };
+  }
+
+  /** Harvest fees (permissionless; proceeds route to the creator and protocol). */
+  async harvest(): Promise<`0x${string}`> {
+    const wallet = requireWallet(this.ctx);
     return wallet.writeContract({
       address: this.vault,
-      abi: berryJuicerAbi,
-      functionName: "setYieldMode",
-      args: [positionId, mode],
+      abi: vaultAbi,
+      functionName: "harvest",
+      args: [],
       account: wallet.account ?? null,
       chain: wallet.chain,
     });
   }
 
-  /** Withdraw a position in full. */
-  async withdraw(positionId: bigint): Promise<`0x${string}`> {
-    const wallet = this.requireWallet();
+  /** Withdraw the position in full (creator only). */
+  async withdraw(): Promise<`0x${string}`> {
+    const wallet = requireWallet(this.ctx);
     return wallet.writeContract({
       address: this.vault,
-      abi: berryJuicerAbi,
+      abi: vaultAbi,
       functionName: "withdraw",
-      args: [positionId],
+      args: [],
       account: wallet.account ?? null,
       chain: wallet.chain,
     });
-  }
-
-  private requireWallet(): WalletClient {
-    if (!this.walletClient) {
-      throw new Error("A walletClient is required for write operations.");
-    }
-    return this.walletClient;
   }
 }

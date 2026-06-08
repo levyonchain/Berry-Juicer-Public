@@ -1,59 +1,57 @@
 # Berry Juicer — Agent Skill
 
-Turn idle token supply into yield, and take that yield as USD or as AI inference.
-Built so agents operate on the same contracts and API as humans, with no
-agent-specific path.
+Put idle token supply to work and receive AI inference in return. Berry Juicer
+deploys one isolated vault per position; agents use the same factory and vaults
+as humans, with no agent-specific path.
 
-Chain: Base. Vault address and quote asset: see `GET /api/config`.
+Chain: Base. Factory address, quote asset, and creator share: see `GET /api/config`.
 
 ## Concepts
 
-- **Position** — a single-sided liquidity position opened from a creator's
-  deposited token supply. It earns swap fees over time.
-- **Yield mode** — how the creator's share of yield is paid:
-  - `Quote` (0): the pool's quote asset (e.g. WETH/USDC).
-  - `Inference` (1): routed into AI inference credits via a partner program. An
-    agent's idle supply becomes the compute it runs on.
-- **Split** — accrued yield is divided between the creator and the protocol. The
-  protocol fee (basis points) is published at `GET /api/config` and on-chain via
-  `protocolFeeBps()`.
+- **Factory** — deploys one isolated **vault** per deposit. The creator triggers
+  creation and pays the gas.
+- **Position vault** — a single position. It custodies only its own creator's
+  principal and fees (positions are isolated from one another).
+- **Principal** — the deposited supply (and any quote it converts into) belongs
+  to the creator and is returned on withdraw.
+- **Fees** — split: the **creator share** (e.g. 80%) is credited as **AI
+  inference** (fulfilled off-chain via partner programs); the **protocol margin**
+  (the remainder) is retained by the protocol. The creator does not receive the
+  quote asset for their fee share. Because inference is sourced at a discount, the
+  credited value typically buys more compute than its face value.
 
 ## On-chain surface (verify without trusting the API)
 
-- `deposit(token, amount, mode) -> positionId` — open a position. Requires a
-  prior ERC-20 approval of `amount` to the vault.
-- `setYieldMode(positionId, mode)` — switch between `Quote` and `Inference`.
-- `withdraw(positionId)` — exit in full at any time; settles outstanding yield,
-  then returns remaining token and quote.
-- `pendingYield(positionId) -> uint256` — accrued, undistributed yield (quote
-  terms).
-- `positionInfo(positionId) -> (creator, token, amount, mode)`.
+Factory:
+- `createVault(token, amount) -> vault` — deploy an isolated position vault and
+  deposit into it. Requires a prior ERC-20 approval of `amount` to the factory.
+- `vaultsOf(creator) -> address[]` — all vaults a creator owns.
 
-`distribute(positionId)` is permissionless; proceeds always go to the position's
-creator, so an automation agent may trigger payouts without being able to divert
-them.
+Vault (one per position):
+- `harvest()` — permissionless; credits the creator inference for their share and
+  sends the protocol its margin. Proceeds always route to the creator/protocol, so
+  automation can trigger it without diverting funds.
+- `withdraw()` — creator only; settles fees, then returns principal.
+- `pendingFees() -> uint256`, `position() -> (token, amount, open)`, `creator()`.
 
 ## SDK
 
-`@berry/juicer-sdk` wraps the surface above:
-
 ```ts
-import { JuicerClient, YieldMode } from "@berry/juicer-sdk";
+import { JuicerFactoryClient, JuicerVaultClient } from "@berry/juicer-sdk";
 
-const juicer = new JuicerClient({ vault, publicClient, walletClient });
+const factory = new JuicerFactoryClient(factoryAddress, { publicClient, walletClient });
+await factory.createVault(token, amount); // approve the factory first
 
-// open a position, taking yield as inference
-const tx = await juicer.deposit(token, amount, YieldMode.Inference);
-
-// check the projected split
-const { creator, protocol } = await juicer.pendingSplit(positionId);
+const vaults = await factory.vaultsOf(myAddress);
+const vault = new JuicerVaultClient(vaults[0], { publicClient, walletClient });
+const { creatorValue, protocolMargin } = await vault.pendingSplit();
 ```
 
 ## Typical agent flow
 
-1. Read `GET /api/config` for the vault address, quote asset, and protocol fee.
-2. Approve the token to the vault.
-3. `deposit(token, amount, YieldMode.Inference)` to put idle supply to work and
-   take yield as compute.
-4. Poll `pendingYield` / `pendingSplit`; call `distribute` when worthwhile.
-5. `withdraw` to exit at any time.
+1. Read `GET /api/config` for the factory address, quote asset, and creator share.
+2. Approve the token to the factory.
+3. `createVault(token, amount)` to open an isolated position.
+4. Poll the vault's `pendingFees` / `pendingSplit`; the creator share accrues as
+   inference on harvest.
+5. `withdraw()` to exit at any time and reclaim principal.

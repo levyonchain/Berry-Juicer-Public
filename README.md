@@ -3,9 +3,12 @@
 Single-sided yield on idle token supply, built for AI agents.
 
 Berry Juicer lets a creator, human or autonomous agent, put idle token supply to
-work as a single-sided liquidity position that earns swap fees. The creator
-takes their share of that yield as the pool's quote asset, or, uniquely for
-agents, as AI inference: idle supply becomes the compute the agent runs on.
+work as a single-sided liquidity position that earns swap fees. Each deposit gets
+its own isolated vault (deployed per position), so funds are never pooled across
+creators. The fees are
+split: the creator's share is credited as AI inference, idle supply becomes the
+compute the agent runs on, while the protocol retains a margin. The deposited
+supply remains the creator's principal and is returned on withdraw.
 
 This repository contains the **public** components of Berry Juicer: the
 interfaces, the orchestration vault, periphery, and the TypeScript SDK. The
@@ -23,7 +26,8 @@ contracts/
   interfaces/        IBerryJuicer, IJuicerStrategy, IInferenceRouter
   libraries/         YieldSplit (open split math)
   periphery/         JuicerLens (read-only convenience layer)
-  BerryJuicerVault.sol   orchestration: custody, access control, payout routing
+  BerryJuicerVault.sol     one isolated position vault (clone target)
+  BerryJuicerFactory.sol   deploys one vault per position (EIP-1167 clones)
 sdk/                 @berry/juicer-sdk (TypeScript client)
 test/                Foundry tests + reference mocks
 script/              deployment scripts

@@ -8,50 +8,40 @@ import {YieldSplit} from "./libraries/YieldSplit.sol";
 
 interface IERC20Minimal {
     function transfer(address to, uint256 amount) external returns (bool);
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address) external view returns (uint256);
 }
 
 /// @title BerryJuicerVault
-/// @notice The open orchestration layer of Berry Juicer. Custodies creator deposits, enforces
-///         access control, splits yield, and routes payouts. It delegates all position mechanics
-///         to a strategy implementing {IJuicerStrategy} (proprietary, not in this repo).
-/// @dev Intentionally open. Nothing here reveals how positions are ranged or rebalanced; the
-///      vault only knows "open / collect / close" against the strategy seam. Funds custody and
-///      authorization live here so they can be reviewed publicly.
+/// @notice A single Berry Juicer position. One vault per deposit, deployed as a minimal-proxy
+///         clone by {BerryJuicerFactory}. Each clone is its own custody and accounting boundary:
+///         it holds only its own creator's principal and fees, so positions are isolated from one
+///         another and there is no shared pool of funds to drain.
+/// @dev Clone-safe: state is set in {initialize}, not a constructor, and there are no per-instance
+///      immutables. The proprietary position math lives behind {IJuicerStrategy}; this vault only
+///      orchestrates custody, the fee split, and payout routing.
 contract BerryJuicerVault is IBerryJuicer {
-    IJuicerStrategy public immutable strategy;
+    IJuicerStrategy public strategy;
     IInferenceRouter public inferenceRouter;
-    address public immutable quote;
+    address public quote;
 
-    uint256 public protocolFeeBps;
+    address public override creator;
+    address public operator; // master handler; informational + may trigger harvests
     address public feeRecipient;
-    address public owner;
+    uint256 public override creatorShareBps;
 
-    struct Position {
-        address creator;
-        address token;
-        uint256 amount;
-        YieldMode mode;
-        bytes32 strategyKey;
-        bool open;
-    }
+    address public token;
+    uint256 public amount;
+    bytes32 public strategyKey;
+    bool public isOpen;
 
-    mapping(uint256 => Position) internal positions;
-    uint256 public nextPositionId = 1;
-
-    // simple non-reentrant guard
+    bool private _initialized;
     uint256 private _lock = 1;
 
-    error NotOwner();
+    error AlreadyInitialized();
     error NotCreator();
     error PositionClosed();
     error InferenceUnavailable();
     error Reentrant();
-
-    modifier onlyOwner() {
-        if (msg.sender != owner) revert NotOwner();
-        _;
-    }
 
     modifier nonReentrant() {
         if (_lock != 1) revert Reentrant();
@@ -60,132 +50,100 @@ contract BerryJuicerVault is IBerryJuicer {
         _lock = 1;
     }
 
-    constructor(address strategy_, address feeRecipient_, uint256 protocolFeeBps_) {
+    /// @notice Initialize a freshly-cloned vault. Assumes the factory has already transferred
+    ///         `amount_` of `token_` into this contract. Opens the position via the strategy.
+    /// @dev Callable once. The factory is the only intended caller.
+    function initialize(
+        address creator_,
+        address token_,
+        uint256 amount_,
+        address strategy_,
+        address inferenceRouter_,
+        address feeRecipient_,
+        address operator_,
+        uint256 creatorShareBps_
+    ) external {
+        if (_initialized) revert AlreadyInitialized();
+        _initialized = true;
+        _lock = 1; // clones do not run field initializers, so set the guard here
+
+        creator = creator_;
+        token = token_;
+        amount = amount_;
         strategy = IJuicerStrategy(strategy_);
+        inferenceRouter = IInferenceRouter(inferenceRouter_);
         quote = IJuicerStrategy(strategy_).quoteAsset();
         feeRecipient = feeRecipient_;
-        protocolFeeBps = protocolFeeBps_;
-        owner = msg.sender;
-    }
+        operator = operator_;
+        creatorShareBps = creatorShareBps_;
 
-    // --- creator actions ---------------------------------------------------
-
-    /// @inheritdoc IBerryJuicer
-    function deposit(address token, uint256 amount, YieldMode mode)
-        external
-        nonReentrant
-        returns (uint256 positionId)
-    {
-        // pull the creator's supply, then hand it to the strategy to deploy
-        IERC20Minimal(token).transferFrom(msg.sender, address(strategy), amount);
-        bytes32 key = strategy.open(token, amount);
-
-        positionId = nextPositionId++;
-        positions[positionId] = Position({
-            creator: msg.sender, token: token, amount: amount, mode: mode, strategyKey: key, open: true
-        });
-
-        emit Deposited(msg.sender, token, amount, mode);
+        // the deposited supply already sits in this vault; deploy it as the position
+        strategyKey = strategy.open(token_, amount_);
+        isOpen = true;
     }
 
     /// @inheritdoc IBerryJuicer
-    function setYieldMode(uint256 positionId, YieldMode mode) external {
-        Position storage p = positions[positionId];
-        if (msg.sender != p.creator) revert NotCreator();
-        if (!p.open) revert PositionClosed();
-        p.mode = mode;
-        emit YieldModeChanged(msg.sender, mode);
-    }
+    function harvest() public nonReentrant {
+        if (!isOpen) revert PositionClosed();
 
-    /// @notice Collect and distribute accrued yield for a position to its creator.
-    /// @dev Permissionless to call; proceeds always go to the position's creator, so anyone
-    ///      (including an automation bot) may trigger a distribution without being able to divert it.
-    function distribute(uint256 positionId) public nonReentrant {
-        Position storage p = positions[positionId];
-        if (!p.open) revert PositionClosed();
+        uint256 fees = strategy.collect(strategyKey);
+        if (fees == 0) return;
 
-        uint256 collected = strategy.collect(p.strategyKey);
-        if (collected == 0) return;
+        (uint256 creatorValue, uint256 protocolMargin) = YieldSplit.split(fees, creatorShareBps);
 
-        (uint256 protocolShare, uint256 creatorShare) = YieldSplit.split(collected, protocolFeeBps);
-
-        if (protocolShare > 0) IERC20Minimal(quote).transfer(feeRecipient, protocolShare);
-        _payCreator(p, creatorShare);
-
-        emit YieldDistributed(p.creator, creatorShare, protocolShare);
-    }
-
-    /// @inheritdoc IBerryJuicer
-    function withdraw(uint256 positionId) external nonReentrant {
-        Position storage p = positions[positionId];
-        if (msg.sender != p.creator) revert NotCreator();
-        if (!p.open) revert PositionClosed();
-
-        // settle any outstanding yield first, then close the underlying position
-        uint256 collected = strategy.collect(p.strategyKey);
-        if (collected > 0) {
-            (uint256 protocolShare, uint256 creatorShare) = YieldSplit.split(collected, protocolFeeBps);
-            if (protocolShare > 0) IERC20Minimal(quote).transfer(feeRecipient, protocolShare);
-            _payCreator(p, creatorShare);
+        if (address(inferenceRouter) == address(0) || !inferenceRouter.isActive()) {
+            revert InferenceUnavailable();
         }
 
-        (uint256 tokenReturned, uint256 quoteReturned) = strategy.close(p.strategyKey);
-        p.open = false;
+        if (protocolMargin > 0) IERC20Minimal(quote).transfer(feeRecipient, protocolMargin);
+        if (creatorValue > 0) {
+            IERC20Minimal(quote).transfer(address(inferenceRouter), creatorValue);
+            inferenceRouter.creditInference(creator, quote, creatorValue);
+        }
 
-        if (tokenReturned > 0) IERC20Minimal(p.token).transfer(p.creator, tokenReturned);
-        if (quoteReturned > 0) IERC20Minimal(quote).transfer(p.creator, quoteReturned);
-
-        emit Withdrawn(p.creator, tokenReturned, quoteReturned);
+        emit Harvested(creator, fees, creatorValue, protocolMargin);
     }
 
-    // --- payout routing ----------------------------------------------------
+    /// @inheritdoc IBerryJuicer
+    function withdraw() external nonReentrant {
+        if (msg.sender != creator) revert NotCreator();
+        if (!isOpen) revert PositionClosed();
 
-    function _payCreator(Position storage p, uint256 amount) internal {
-        if (amount == 0) return;
-
-        if (p.mode == YieldMode.Inference) {
-            // route through the configured inference partner; fall back is to revert,
-            // so a creator never silently loses their yield if the path is down
-            if (address(inferenceRouter) == address(0) || !inferenceRouter.isActive()) {
-                revert InferenceUnavailable();
+        // settle outstanding fees before closing
+        uint256 fees = strategy.collect(strategyKey);
+        if (fees > 0) {
+            (uint256 creatorValue, uint256 protocolMargin) = YieldSplit.split(fees, creatorShareBps);
+            if (protocolMargin > 0) IERC20Minimal(quote).transfer(feeRecipient, protocolMargin);
+            if (creatorValue > 0) {
+                if (address(inferenceRouter) != address(0) && inferenceRouter.isActive()) {
+                    IERC20Minimal(quote).transfer(address(inferenceRouter), creatorValue);
+                    inferenceRouter.creditInference(creator, quote, creatorValue);
+                } else {
+                    // safety fallback: never trap the creator's value. If inference is
+                    // unavailable at exit, return the creator's fee share as quote.
+                    IERC20Minimal(quote).transfer(creator, creatorValue);
+                }
             }
-            IERC20Minimal(quote).transfer(address(inferenceRouter), amount);
-            inferenceRouter.fulfill(p.creator, quote, amount);
-        } else {
-            IERC20Minimal(quote).transfer(p.creator, amount);
+            emit Harvested(creator, fees, creatorValue, protocolMargin);
         }
-    }
 
-    // --- views -------------------------------------------------------------
+        // return principal: the creator's deposited supply and any quote it converted into
+        (uint256 tokenReturned, uint256 quoteReturned) = strategy.close(strategyKey);
+        isOpen = false;
+
+        if (tokenReturned > 0) IERC20Minimal(token).transfer(creator, tokenReturned);
+        if (quoteReturned > 0) IERC20Minimal(quote).transfer(creator, quoteReturned);
+
+        emit Withdrawn(creator, tokenReturned, quoteReturned);
+    }
 
     /// @inheritdoc IBerryJuicer
-    function pendingYield(uint256 positionId) external view returns (uint256) {
-        return strategy.accrued(positions[positionId].strategyKey);
+    function position() external view returns (address token_, uint256 amount_, bool open_) {
+        return (token, amount, isOpen);
     }
 
     /// @inheritdoc IBerryJuicer
-    function positionInfo(uint256 positionId)
-        external
-        view
-        returns (address creator, address token, uint256 amount, YieldMode mode)
-    {
-        Position storage p = positions[positionId];
-        return (p.creator, p.token, p.amount, p.mode);
-    }
-
-    // --- admin (config only; no power over creator funds) ------------------
-
-    function setInferenceRouter(address router) external onlyOwner {
-        inferenceRouter = IInferenceRouter(router);
-    }
-
-    function setFee(uint256 newFeeBps, address newRecipient) external onlyOwner {
-        // bounded by YieldSplit.MAX_PROTOCOL_FEE_BPS at split time
-        protocolFeeBps = newFeeBps;
-        feeRecipient = newRecipient;
-    }
-
-    function transferOwnership(address newOwner) external onlyOwner {
-        owner = newOwner;
+    function pendingFees() external view returns (uint256) {
+        return strategy.accrued(strategyKey);
     }
 }

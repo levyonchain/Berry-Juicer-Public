@@ -5,16 +5,15 @@ import {IJuicerStrategy} from "../../contracts/interfaces/IJuicerStrategy.sol";
 import {IInferenceRouter} from "../../contracts/interfaces/IInferenceRouter.sol";
 import {MockERC20} from "./MockERC20.sol";
 
-/// @notice A deliberately trivial strategy that satisfies {IJuicerStrategy} for testing only.
-/// @dev This is NOT the Berry Juicer position strategy. The real strategy (single-sided V4
-///      position selection, ranging, and rebalancing) is proprietary and not in this repo.
-///      This stub simply records deposits and lets a test mint synthetic "fees" so the open
-///      vault and periphery can be exercised end to end.
+/// @notice A trivial strategy satisfying {IJuicerStrategy} for testing only. NOT the real Berry
+///         Juicer strategy. It is a pure bookkeeper: custody stays in the calling vault. Fees are
+///         simulated by minting quote directly into the vault that opened the position, modelling
+///         that a position's funds live in its own vault, never in a shared pot.
 contract ReferenceStrategy is IJuicerStrategy {
     address public immutable quote;
-    mapping(bytes32 => uint256) public depositOf;
-    mapping(bytes32 => address) public tokenOf;
-    mapping(bytes32 => uint256) public feesOf;
+    mapping(bytes32 => uint256) public principalOf;
+    mapping(bytes32 => uint256) public accruedOf;
+    mapping(bytes32 => address) public vaultOf;
     uint256 internal nonce;
 
     constructor(address quote_) {
@@ -23,34 +22,29 @@ contract ReferenceStrategy is IJuicerStrategy {
 
     function open(address token, uint256 amount) external returns (bytes32 key) {
         key = keccak256(abi.encodePacked(msg.sender, token, amount, nonce++));
-        depositOf[key] = amount;
-        tokenOf[key] = token;
+        principalOf[key] = amount;
+        vaultOf[key] = msg.sender; // the vault keeps custody of the principal token
     }
 
-    /// @dev Test helper: simulate fee accrual for a position.
+    /// @dev Test helper: simulate fee accrual by minting quote into the owning vault.
     function simulateFees(bytes32 key, uint256 amount) external {
-        feesOf[key] += amount;
-        MockERC20(quote).mint(address(this), amount);
+        accruedOf[key] += amount;
+        MockERC20(quote).mint(vaultOf[key], amount);
     }
 
     function collect(bytes32 key) external returns (uint256 quoteAmount) {
-        quoteAmount = feesOf[key];
-        feesOf[key] = 0;
-        if (quoteAmount > 0) MockERC20(quote).transfer(msg.sender, quoteAmount);
+        quoteAmount = accruedOf[key]; // funds already sit in the vault
+        accruedOf[key] = 0;
     }
 
     function close(bytes32 key) external returns (uint256 tokenAmount, uint256 quoteAmount) {
-        tokenAmount = depositOf[key];
-        depositOf[key] = 0;
-        quoteAmount = feesOf[key];
-        feesOf[key] = 0;
-        // return the deployed principal (and any uncollected quote) to the caller (the vault)
-        if (tokenAmount > 0) MockERC20(tokenOf[key]).transfer(msg.sender, tokenAmount);
-        if (quoteAmount > 0) MockERC20(quote).transfer(msg.sender, quoteAmount);
+        tokenAmount = principalOf[key]; // principal token already sits in the vault
+        principalOf[key] = 0;
+        quoteAmount = 0;
     }
 
     function accrued(bytes32 key) external view returns (uint256) {
-        return feesOf[key];
+        return accruedOf[key];
     }
 
     function quoteAsset() external view returns (address) {
@@ -58,7 +52,8 @@ contract ReferenceStrategy is IJuicerStrategy {
     }
 }
 
-/// @notice A no-op inference router for tests: 1 quote unit -> 1 credit.
+/// @notice A no-op inference router for tests. Records credited value (off-chain fulfillment is
+///         modelled as a simple running tally here).
 contract ReferenceInferenceRouter is IInferenceRouter {
     bool public active = true;
     mapping(address => uint256) public creditsOf;
@@ -67,14 +62,9 @@ contract ReferenceInferenceRouter is IInferenceRouter {
         active = a;
     }
 
-    function fulfill(address recipient, address, uint256 quoteAmount) external returns (uint256 credits) {
-        credits = quoteAmount; // 1:1 for tests
-        creditsOf[recipient] += credits;
-        emit InferenceFulfilled(recipient, quoteAmount, credits);
-    }
-
-    function quoteCredits(address, uint256 quoteAmount) external pure returns (uint256) {
-        return quoteAmount;
+    function creditInference(address recipient, address quoteAsset, uint256 quoteValue) external {
+        creditsOf[recipient] += quoteValue;
+        emit InferenceCredited(recipient, quoteAsset, quoteValue);
     }
 
     function isActive() external view returns (bool) {

@@ -26,13 +26,20 @@ contract BerryJuicerFactory {
 
     address public owner;
     address public operator;
+    address public swapRouter;
+    address public usdc;
     address public feeRecipient;
     address public inferenceRouter;
+    // B-ISOLATED: creator -> dedicated inference USDC wallet. Set by owner/operator BEFORE the
+    // creator's createVault, so the new vault inits with the isolated payout target. 0 = router.
+    mapping(address => address) public inferencePayoutOf;
+    event InferencePayoutSet(address indexed creator, address indexed wallet);
     address public strategy;
     uint256 public creatorShareBps;
 
     uint256 public vaultCount;
     mapping(uint256 => address) public vaultById;
+    mapping(address => bool) public isVault;
     mapping(address => address[]) internal _vaultsOf;
 
     event VaultCreated(
@@ -54,7 +61,9 @@ contract BerryJuicerFactory {
         address inferenceRouter_,
         address feeRecipient_,
         address operator_,
-        uint256 creatorShareBps_
+        uint256 creatorShareBps_,
+        address swapRouter_,
+        address usdc_
     ) {
         if (vaultImplementation_ == address(0) || strategy_ == address(0)) {
             revert ZeroAddress();
@@ -65,6 +74,8 @@ contract BerryJuicerFactory {
         feeRecipient = feeRecipient_;
         operator = operator_;
         creatorShareBps = creatorShareBps_;
+        swapRouter = swapRouter_;
+        usdc = usdc_;
         owner = msg.sender;
     }
 
@@ -75,13 +86,24 @@ contract BerryJuicerFactory {
 
         uint256 id = ++vaultCount;
         vaultById[id] = vault;
+        isVault[vault] = true;
         _vaultsOf[msg.sender].push(vault);
 
         // move the creator's supply directly into the new vault, then initialize it
         IERC20Pull(token).transferFrom(msg.sender, vault, amount);
         BerryJuicerVault(vault)
             .initialize(
-                msg.sender, token, amount, strategy, inferenceRouter, feeRecipient, operator, creatorShareBps
+                msg.sender,
+                token,
+                amount,
+                strategy,
+                inferenceRouter,
+                feeRecipient,
+                operator,
+                creatorShareBps,
+                swapRouter,
+                usdc,
+                inferencePayoutOf[msg.sender]
             );
 
         emit VaultCreated(msg.sender, vault, token, amount, id);
@@ -93,6 +115,13 @@ contract BerryJuicerFactory {
     }
 
     // --- admin (config only; cannot touch deployed vaults' funds) ----------
+
+    /// @notice B-ISOLATED: register a creator's dedicated inference wallet (owner or operator).
+    function setInferencePayout(address creator, address wallet) external {
+        require(msg.sender == owner || msg.sender == operator, "not authorized");
+        inferencePayoutOf[creator] = wallet;
+        emit InferencePayoutSet(creator, wallet);
+    }
 
     function setConfig(address strategy_, address inferenceRouter_, address feeRecipient_, address operator_)
         external

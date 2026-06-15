@@ -23,7 +23,7 @@ interface IBerryJuicer {
     /// @notice Harvest accrued fees: credit the creator inference for their share, protocol its margin.
     /// @dev Permissionless; proceeds always route to the creator and protocol, so anyone (typically
     ///      the operator/automation) may trigger it without being able to divert funds.
-    function harvest() external;
+    function harvest(uint256 minUsdcOut) external returns (uint256 usdcOut);
 
     /// @notice Withdraw the position in full. Only the creator. Settles fees, then returns principal.
     function withdraw() external;

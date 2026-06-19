@@ -5,6 +5,7 @@ import {BerryJuicerVault} from "./BerryJuicerVault.sol";
 
 interface IERC20Pull {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
 }
 
 /// @title BerryJuicerFactory
@@ -49,6 +50,8 @@ contract BerryJuicerFactory {
 
     error NotOwner();
     error ZeroAddress();
+    error ZeroAmount();
+    error TransferFailed();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -81,7 +84,12 @@ contract BerryJuicerFactory {
 
     /// @notice Create an isolated Juicer position vault and deposit `amount` of `token` into it.
     /// @dev The caller must have approved this factory for `amount` of `token`. The caller pays gas.
+    ///      The vault is initialized with the *delta actually received* (not the requested amount),
+    ///      so fee-on-transfer / rebasing tokens cannot leave the vault claiming more than it holds.
     function createVault(address token, uint256 amount) external returns (address vault) {
+        if (token == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+
         vault = _clone(vaultImplementation);
 
         uint256 id = ++vaultCount;
@@ -89,13 +97,20 @@ contract BerryJuicerFactory {
         isVault[vault] = true;
         _vaultsOf[msg.sender].push(vault);
 
-        // move the creator's supply directly into the new vault, then initialize it
-        IERC20Pull(token).transferFrom(msg.sender, vault, amount);
+        // Pull the creator's supply directly into the new vault, measure the delta, then initialize.
+        // Using the balance delta as the canonical amount makes the vault honest about its holdings
+        // for fee-on-transfer or rebasing tokens. The SafeERC20-style call below also tolerates the
+        // USDT-style ERC20s that return no data on success.
+        uint256 beforeBal = IERC20Pull(token).balanceOf(vault);
+        _safeTransferFrom(token, msg.sender, vault, amount);
+        uint256 received = IERC20Pull(token).balanceOf(vault) - beforeBal;
+        if (received == 0) revert TransferFailed();
+
         BerryJuicerVault(vault)
             .initialize(
                 msg.sender,
                 token,
-                amount,
+                received,
                 strategy,
                 inferenceRouter,
                 feeRecipient,
@@ -106,7 +121,7 @@ contract BerryJuicerFactory {
                 inferencePayoutOf[msg.sender]
             );
 
-        emit VaultCreated(msg.sender, vault, token, amount, id);
+        emit VaultCreated(msg.sender, vault, token, received, id);
     }
 
     /// @notice All vaults created by `creator`.
@@ -143,6 +158,19 @@ contract BerryJuicerFactory {
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert ZeroAddress();
         owner = newOwner;
+    }
+
+    /// @dev SafeERC20-style transferFrom: tolerates ERC20s that return no value on success
+    ///      (e.g. USDT) and reverts on tokens that return false. The post-call balance check
+    ///      in `createVault` is what makes fee-on-transfer / rebasing tokens safe; this helper
+    ///      only guarantees the call did not silently fail.
+    function _safeTransferFrom(address token, address from, address to, uint256 value) internal {
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(IERC20Pull.transferFrom.selector, from, to, value)
+        );
+        if (!success) revert TransferFailed();
+        // Empty return data is fine (USDT-style). Non-empty data must decode to true.
+        if (data.length > 0 && !abi.decode(data, (bool))) revert TransferFailed();
     }
 
     /// @dev Minimal EIP-1167 clone. Cheap deploy; each clone has isolated storage and balance.
